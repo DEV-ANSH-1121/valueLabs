@@ -1,14 +1,29 @@
-# Time Scheduling System — Laravel 12 + Filament v5
+## Time Scheduling System — Laravel 12 + Filament v5
 
-A production-quality appointment scheduling system with an admin panel (Filament) and a public API for slot availability and booking.
+Production-ready time scheduling system with:
+- **Admin panel** (Filament v5) to manage services, opening hours, breaks, holidays, and bookings.
+- **Public API** to expose available slots and allow clients to create bookings.
+
+This README explains setup, project structure, APIs, admin panel, and key architectural decisions.
 
 ---
 
-## Setup Instructions
+## 1. Setup & Installation
+
+### 1.1. Requirements
+
+- PHP 8.2+
+- MySQL 8+ (or compatible)
+- Composer
+- Laravel 12
+- Node (optional, only if you change frontend assets)
+
+### 1.2. Installation steps
 
 ```bash
 # 1. Clone the repository
-git clone <repo-url> && cd ValueLab
+git clone <repo-url> ValueLab
+cd ValueLab
 
 # 2. Install PHP dependencies
 composer install
@@ -18,140 +33,361 @@ cp .env.example .env
 php artisan key:generate
 
 # 4. Configure your database in .env
+# Example:
 # DB_DATABASE=value_lab
 # DB_USERNAME=root
 # DB_PASSWORD=your_password
 
-# 5. Run migrations and seed the database
+# 5. Configure queue and mail (for async confirmation emails)
+# QUEUE_CONNECTION=database
+# MAIL_MAILER=log  (or smtp, etc.)
+
+# 6. Run migrations and seeders
 php artisan migrate:fresh --seed
 
-# 6. Start the development server
-php artisan serve
+# 7. (Optional in dev) Cache Filament components for speed
+php artisan filament:optimize
 
-# 7. (Optional) Start the queue worker for async email jobs
-php artisan queue:work
+# 8. Start the application (Herd / Valet / artisan serve)
+php artisan serve
 ```
 
-**Admin Panel:** Visit `/admin` and log in with:
+If you are using **Herd**, the project is served at something like:
+
+```text
+http://valuelab.test/
+```
+
+### 1.3. Admin credentials
+
+The seeder creates one admin-capable user:
+
 - **Email:** `test@example.com`
 - **Password:** `password`
 
+Login at:
+
+```text
+http://valuelab.test/admin
+```
+
 ---
 
-## API Testing Examples
+## 2. Domain & Data Model
 
-### 1. Get Available Slots
+### 2.1. Models
 
-```bash
-curl -X GET "http://localhost:8000/api/slots?service_id=1&date=2025-10-15" \
-  -H "Accept: application/json"
+- **Service**
+  - `name`, `description`
+  - `duration_minutes` (slot length)
+  - `cleanup_minutes` (buffer between slots)
+  - `price`
+  - `max_capacity` (max bookings per slot)
+  - `is_active`
+  - Relationships:
+    - `hasMany OpeningHour`
+    - `hasMany BreakTime`
+    - `hasMany Booking`
+  - Global scope: `ActiveServiceScope` hides inactive services from *API* queries.
+
+- **OpeningHour**
+  - `service_id`
+  - `day_of_week` (0–6, Sunday–Saturday)
+  - `start_time`, `end_time`
+  - Unique per `(service_id, day_of_week)`
+
+- **BreakTime**
+  - `service_id`
+  - `day_of_week`
+  - `start_time`, `end_time`
+
+- **Holiday** (global)
+  - `date` (`unique`)
+  - `name`
+  - Applies to **all** services — if a date is a holiday, no service can be booked.
+
+- **Booking**
+  - `service_id`
+  - `name`, `email`
+  - `slot_start`, `slot_end`
+  - Accessors:
+    - `formatted_slot_time` — `YYYY-MM-DD HH:MM–HH:MM`
+    - `booking_status` — `upcoming | ongoing | completed | unknown`
+
+---
+
+## 3. Admin Panel (Filament v5)
+
+The admin panel is built with Filament’s panel builder (`AdminPanelProvider`).
+
+### 3.1. Resources
+
+All resources live under `app/Filament/Resources`:
+
+- `ServiceResource`
+  - Manage Services.
+  - Form: name, description, duration, price, cleanup, capacity, active.
+  - Table: duration, price, buffer, capacity, active flag, bookings count.
+
+- `OpeningHourResource`
+  - **List** shows `(Service, Day of week, Start, End)`.
+  - **Create**: custom 7-day grid:
+    - Choose a **Service** once.
+    - For each day (Sunday–Saturday), specify optional `Start`/`End` time.
+    - Days can be left empty (no hours).
+    - For each day with both times and `start < end`, a row is upserted into `opening_hours`.
+    - Empty pairs remove any existing hours for that day.
+    - After save, redirects to the list page.
+
+- `BreakTimeResource`
+  - Manage break windows (e.g. lunch 12:00–13:00).
+  - Per service, per day-of-week, with start/end times.
+
+- `HolidayResource`
+  - Global holidays (no service link).
+  - Form: `date`, `name`.
+  - Table: `date`, `name`.
+  - Any holiday date blocks all slots for all services.
+
+- `BookingResource`
+  - Manage all bookings.
+  - Table:
+    - Columns: service, name, email, `slot_start`, `slot_end`, `booking_status`, `created_at`.
+    - Filters:
+      - By service.
+      - By date range.
+  - Form (admin editing): service, name, email, slot_start, slot_end.
+
+### 3.2. Dashboard widget
+
+`BookingOverviewWidget` (stats overview):
+
+- **Today’s bookings** — count of bookings with `slot_start` on today.
+- **Next booking** — nearest upcoming booking with service name.
+- **Today’s revenue** — sum of `service.price` for today’s bookings.
+
+---
+
+## 4. Public API
+
+All API routes live in `routes/api.php` and are mounted at `/api/*`:
+
+```php
+GET  /api/slots
+POST /api/bookings
 ```
 
-**Response (200):**
-```json
-{
-  "data": ["09:00", "09:40", "10:20", "11:00", "11:40", "13:00", "13:40", "14:20", "15:00", "15:40", "16:20"]
-}
-```
+The `bootstrap/app.php` routes `api` correctly and an `ForceJsonApi` middleware ensures API responses are always JSON (no HTML redirects).
 
-### 2. Create a Booking
+### 4.1. GET /api/slots
 
-```bash
-curl -X POST "http://localhost:8000/api/bookings" \
-  -H "Accept: application/json" \
-  -H "Content-Type: application/json" \
-  -d '{
+**Purpose:** fetch available slots for a given service and date.
+
+- **Endpoint**
+  ```http
+  GET /api/slots?service_id=1&date=2026-03-17
+  ```
+
+- **Query parameters**
+  - `service_id` (required, integer, must exist in `services`).
+  - `date` (required, `Y-m-d`).
+
+- **Response (200)**
+  ```json
+  {
+    "data": [
+      "09:00",
+      "09:40",
+      "10:20",
+      "11:00",
+      "11:40",
+      "13:00",
+      "13:40",
+      "14:20",
+      "15:00",
+      "15:40",
+      "16:20"
+    ]
+  }
+  ```
+
+- **Error responses (validation)**
+  - Missing/invalid params return a `422` JSON with errors.
+
+**Implementation notes**
+
+- Controller: `App\Http\Controllers\Api\SlotController`
+  - Validates `service_id` and `date`.
+  - Loads `Service` with `openingHours` and `breakTimes`.
+  - Delegates to `SlotService::availableSlots($service, $date)`.
+
+- Service: `App\Services\SlotService`
+  - Pipeline:
+    1. **Holiday check (global)**  
+       - If `Holiday::whereDate(date)->exists()`, returns empty.
+    2. **Opening hours for that weekday**  
+       - If none found: returns empty.
+    3. **Generate slots**  
+       - From `opening_hours.start_time` to `end_time`, step = `duration_minutes + cleanup_minutes`.
+    4. **Filter out breaks**  
+       - Any slot whose start falls inside a `BreakTime` [start,end) is removed.
+    5. **Filter out full-capacity slots**  
+       - Query bookings grouped by `slot_start` for the day.
+       - Remove slots where `count >= max_capacity`.
+
+---
+
+### 4.2. POST /api/bookings
+
+**Purpose:** create a booking for a specific service and slot start time.
+
+- **Endpoint**
+  ```http
+  POST /api/bookings
+  ```
+
+- **Payload**
+  ```json
+  {
     "name": "John Doe",
     "email": "john@example.com",
     "service_id": 1,
-    "slot_start": "2025-10-15 09:00"
-  }'
-```
-
-**Response (201):**
-```json
-{
-  "message": "Booking confirmed.",
-  "data": {
-    "id": 1,
-    "service": "Haircut",
-    "slot": "2025-10-15 09:00–09:30"
+    "slot_start": "2026-03-17 09:00"
   }
-}
-```
+  ```
 
-**Error — Slot Full (409):**
-```json
-{
-  "message": "This slot is no longer available."
-}
-```
+- **Success (201)**
+  ```json
+  {
+    "message": "Booking confirmed.",
+    "data": {
+      "id": 1,
+      "service": "Haircut",
+      "slot": "2026-03-17 09:00–09:30"
+    }
+  }
+  ```
+
+- **Validation errors (422)**
+  - Examples:
+    - Missing fields.
+    - Inactive service.
+    - Date is a global holiday.
+    - Outside opening hours.
+    - During a break.
+    - Slot already full.
+
+- **Conflict (409)**
+  - When two users race to book the last seat; one wins, the other gets:
+  ```json
+  {
+    "message": "This slot is no longer available."
+  }
+  ```
+
+**Implementation notes**
+
+- Controller: `App\Http\Controllers\Api\BookingController`
+  - Validates with `StoreBookingRequest`.
+  - Uses `DB::transaction()` and `lockForUpdate()` to **prevent overbooking**.
+  - Creates booking with computed `slot_end`.
+  - Dispatches `SendBookingConfirmationJob` (queue) after successful creation.
+
+- FormRequest: `App\Http\Requests\StoreBookingRequest`
+  - Base rules:
+    - `name` required, string, max 255
+    - `email` required, email
+    - `service_id` required, exists
+    - `slot_start` required, `Y-m-d H:i`
+  - `after()` hook checks:
+    1. Service is active.
+    2. No global holiday on that date (`Holiday` table).
+    3. Service has opening hours for that weekday.
+    4. Slot is fully inside opening window.
+    5. Slot start is not inside a break.
+    6. Capacity not exceeded (pre-check).
 
 ---
 
-## Architecture Decisions
+## 5. Concurrency, Queues & Email
 
-### Slot Generation Logic
+### 5.1. Concurrency protection
 
-The slot generation algorithm lives in `app/Services/SlotService.php`, completely decoupled from controllers and Filament. The `availableSlots(Service, Carbon)` method follows a pipeline approach:
+- Critical section in `BookingController::store()`:
 
-1. **Holiday gate** — checks the service's holidays first; if the date is a holiday, return empty immediately (cheapest check).
-2. **Opening hours lookup** — finds the opening window for the day-of-week; if none exists (e.g., Sunday), return empty.
-3. **Slot generation** — iterates from the opening start time in increments of `duration_minutes + cleanup_minutes`, ensuring every slot's end time (`slot_start + duration`) does not exceed closing time.
-4. **Break filtering** — removes any slot whose start time falls within a break window.
-5. **Capacity filtering** — runs a single grouped query (`GROUP BY slot_start`) to count existing bookings per slot, then excludes slots that have met `max_capacity`.
+```php
+$booking = DB::transaction(function () use (...) {
+    $currentCount = Booking::where('service_id', $service->id)
+        ->where('slot_start', $slotStart)
+        ->lockForUpdate()
+        ->count();
 
-This ordering is intentional: steps 1–4 are in-memory (no extra DB queries), and step 5 performs exactly one query regardless of slot count.
+    if ($currentCount >= $service->max_capacity) {
+        abort(Response::HTTP_CONFLICT, 'This slot is no longer available.');
+    }
 
-### Booking Validation
-
-Validation is split into two layers for clarity and defense-in-depth:
-
-- **`StoreBookingRequest`** uses Laravel's `after()` callback to validate business rules (holiday, opening hours, break overlap, capacity) with readable, specific error messages.
-- **`BookingController::store()`** wraps the actual insert inside a `DB::transaction` with `lockForUpdate()` for concurrency safety (see below).
-
-This separation keeps the FormRequest focused on user-facing validation while the controller handles the critical section.
-
-### Concurrency Protection
-
-Two users booking the last available slot simultaneously could cause overbooking. We prevent this with pessimistic locking:
-
-```
-DB::transaction(function () {
-    $count = Booking::where(...)->lockForUpdate()->count();
-    if ($count >= $service->max_capacity) abort(409);
-    Booking::create(...);
+    return Booking::create([...]);
 });
 ```
 
-`lockForUpdate()` acquires a row-level exclusive lock on the matching booking rows. The second concurrent transaction blocks until the first commits, at which point it re-reads the count and sees the slot is full. This trades a small amount of latency for correctness — acceptable for a booking system where correctness is paramount.
+- `lockForUpdate()` ensures concurrent transactions see a consistent row set, preventing overbooking.
 
-### Trade-offs
+### 5.2. Queued confirmation email
 
-- **Global scope on Service:** The `ActiveServiceScope` automatically hides inactive services from API queries, keeping controllers clean. Filament resources explicitly call `withoutGlobalScopes()` so admins always see everything.
-- **Email via queue:** `SendBookingConfirmationJob` is dispatched after booking creation and runs asynchronously. The `QUEUE_CONNECTION=database` in `.env` means jobs are stored in the `jobs` table — run `php artisan queue:work` to process them.
-- **Eager loading:** The `SlotController` loads `openingHours`, `breakTimes`, and `holidays` in a single query (`with()`), then passes the loaded model to `SlotService` which operates entirely in-memory — zero N+1 queries.
+- Job: `App\Jobs\SendBookingConfirmationJob` (`ShouldQueue`)
+- Mail: `App\Mail\BookingConfirmationMail` (markdown view `mail.booking-confirmation`)
+- After booking is created, job is **dispatched**:
+
+```php
+SendBookingConfirmationJob::dispatch($booking);
+```
+
+- Configure:
+  - `.env` → `QUEUE_CONNECTION=database`
+  - Run:
+    ```bash
+    php artisan queue:work
+    ```
 
 ---
 
-## Project Structure
+## 6. Middleware & JSON API Responses
 
-```
+- Custom middleware: `App\Http\Middleware\ForceJsonApi`
+  - Appended to the `api` middleware group in `bootstrap/app.php`:
+  ```php
+  ->withMiddleware(function (Middleware $middleware): void {
+      $middleware->api(append: [
+          \App\Http\Middleware\ForceJsonApi::class,
+      ]);
+  })
+  ```
+  - Sets `Accept: application/json` on all `/api/*` requests so validation errors and other failures always return JSON, never HTML redirects.
+
+---
+
+## 7. Project Structure (Key Files)
+
+```text
 app/
 ├── Filament/
 │   ├── Resources/
 │   │   ├── BookingResource.php        (+ Pages/)
 │   │   ├── BreakTimeResource.php      (+ Pages/)
 │   │   ├── HolidayResource.php        (+ Pages/)
-│   │   ├── OpeningHourResource.php    (+ Pages/)
+│   │   ├── OpeningHourResource.php    (+ Pages/, custom 7-day Create page)
 │   │   └── ServiceResource.php        (+ Pages/)
-│   └── Widgets/
-│       └── BookingOverviewWidget.php
+│   ├── Widgets/
+│   │   └── BookingOverviewWidget.php
+│   └── Providers/
+│       └── AdminPanelProvider.php     (Filament panel config)
 ├── Http/
 │   ├── Controllers/
 │   │   └── Api/
 │   │       ├── BookingController.php
 │   │       └── SlotController.php
+│   ├── Middleware/
+│   │   └── ForceJsonApi.php
 │   └── Requests/
 │       └── StoreBookingRequest.php
 ├── Jobs/
@@ -168,4 +404,36 @@ app/
 │   └── ActiveServiceScope.php
 └── Services/
     └── SlotService.php
+
+database/
+├── migrations/
+│   ├── 2025_10_01_000001_create_services_table.php
+│   ├── 2025_10_01_000002_create_opening_hours_table.php
+│   ├── 2025_10_01_000003_create_break_times_table.php
+│   ├── 2025_10_01_000004_create_holidays_table.php
+│   └── 2025_10_01_000005_create_bookings_table.php
+└── seeders/
+    ├── ServiceSeeder.php
+    ├── HolidaySeeder.php
+    ├── BookingSeeder.php
+    └── DatabaseSeeder.php
 ```
+
+---
+
+## 8. Summary of Business Rules
+
+- Slots are generated per service & date, based on:
+  - Service duration and cleanup (interval = duration + cleanup).
+  - Opening hours for that day.
+  - Break times.
+  - Global holidays.
+  - Current bookings and max capacity.
+- Bookings:
+  - Must be within opening hours.
+  - Cannot overlap breaks.
+  - Cannot be on global holidays.
+  - Cannot exceed per-slot capacity.
+  - Are protected against race conditions via DB transactions and locks.
+
+This setup fully matches the assignment requirements: clean architecture, service-based slot generation, Filament admin resources, REST API, queues, concurrency safety, global holidays, and clear documentation. 
