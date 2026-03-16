@@ -1,59 +1,171 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Time Scheduling System — Laravel 12 + Filament v5
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+A production-quality appointment scheduling system with an admin panel (Filament) and a public API for slot availability and booking.
 
-## About Laravel
+---
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+## Setup Instructions
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+```bash
+# 1. Clone the repository
+git clone <repo-url> && cd ValueLab
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+# 2. Install PHP dependencies
+composer install
 
-## Learning Laravel
+# 3. Copy environment file and generate app key
+cp .env.example .env
+php artisan key:generate
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework. You can also check out [Laravel Learn](https://laravel.com/learn), where you will be guided through building a modern Laravel application.
+# 4. Configure your database in .env
+# DB_DATABASE=value_lab
+# DB_USERNAME=root
+# DB_PASSWORD=your_password
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+# 5. Run migrations and seed the database
+php artisan migrate:fresh --seed
 
-## Laravel Sponsors
+# 6. Start the development server
+php artisan serve
 
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the [Laravel Partners program](https://partners.laravel.com).
+# 7. (Optional) Start the queue worker for async email jobs
+php artisan queue:work
+```
 
-### Premium Partners
+**Admin Panel:** Visit `/admin` and log in with:
+- **Email:** `test@example.com`
+- **Password:** `password`
 
-- **[Vehikl](https://vehikl.com)**
-- **[Tighten Co.](https://tighten.co)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel)**
-- **[DevSquad](https://devsquad.com/hire-laravel-developers)**
-- **[Redberry](https://redberry.international/laravel-development)**
-- **[Active Logic](https://activelogic.com)**
+---
 
-## Contributing
+## API Testing Examples
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+### 1. Get Available Slots
 
-## Code of Conduct
+```bash
+curl -X GET "http://localhost:8000/api/slots?service_id=1&date=2025-10-15" \
+  -H "Accept: application/json"
+```
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+**Response (200):**
+```json
+{
+  "data": ["09:00", "09:40", "10:20", "11:00", "11:40", "13:00", "13:40", "14:20", "15:00", "15:40", "16:20"]
+}
+```
 
-## Security Vulnerabilities
+### 2. Create a Booking
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+```bash
+curl -X POST "http://localhost:8000/api/bookings" \
+  -H "Accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "John Doe",
+    "email": "john@example.com",
+    "service_id": 1,
+    "slot_start": "2025-10-15 09:00"
+  }'
+```
 
-## License
+**Response (201):**
+```json
+{
+  "message": "Booking confirmed.",
+  "data": {
+    "id": 1,
+    "service": "Haircut",
+    "slot": "2025-10-15 09:00–09:30"
+  }
+}
+```
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+**Error — Slot Full (409):**
+```json
+{
+  "message": "This slot is no longer available."
+}
+```
+
+---
+
+## Architecture Decisions
+
+### Slot Generation Logic
+
+The slot generation algorithm lives in `app/Services/SlotService.php`, completely decoupled from controllers and Filament. The `availableSlots(Service, Carbon)` method follows a pipeline approach:
+
+1. **Holiday gate** — checks the service's holidays first; if the date is a holiday, return empty immediately (cheapest check).
+2. **Opening hours lookup** — finds the opening window for the day-of-week; if none exists (e.g., Sunday), return empty.
+3. **Slot generation** — iterates from the opening start time in increments of `duration_minutes + cleanup_minutes`, ensuring every slot's end time (`slot_start + duration`) does not exceed closing time.
+4. **Break filtering** — removes any slot whose start time falls within a break window.
+5. **Capacity filtering** — runs a single grouped query (`GROUP BY slot_start`) to count existing bookings per slot, then excludes slots that have met `max_capacity`.
+
+This ordering is intentional: steps 1–4 are in-memory (no extra DB queries), and step 5 performs exactly one query regardless of slot count.
+
+### Booking Validation
+
+Validation is split into two layers for clarity and defense-in-depth:
+
+- **`StoreBookingRequest`** uses Laravel's `after()` callback to validate business rules (holiday, opening hours, break overlap, capacity) with readable, specific error messages.
+- **`BookingController::store()`** wraps the actual insert inside a `DB::transaction` with `lockForUpdate()` for concurrency safety (see below).
+
+This separation keeps the FormRequest focused on user-facing validation while the controller handles the critical section.
+
+### Concurrency Protection
+
+Two users booking the last available slot simultaneously could cause overbooking. We prevent this with pessimistic locking:
+
+```
+DB::transaction(function () {
+    $count = Booking::where(...)->lockForUpdate()->count();
+    if ($count >= $service->max_capacity) abort(409);
+    Booking::create(...);
+});
+```
+
+`lockForUpdate()` acquires a row-level exclusive lock on the matching booking rows. The second concurrent transaction blocks until the first commits, at which point it re-reads the count and sees the slot is full. This trades a small amount of latency for correctness — acceptable for a booking system where correctness is paramount.
+
+### Trade-offs
+
+- **Global scope on Service:** The `ActiveServiceScope` automatically hides inactive services from API queries, keeping controllers clean. Filament resources explicitly call `withoutGlobalScopes()` so admins always see everything.
+- **Email via queue:** `SendBookingConfirmationJob` is dispatched after booking creation and runs asynchronously. The `QUEUE_CONNECTION=database` in `.env` means jobs are stored in the `jobs` table — run `php artisan queue:work` to process them.
+- **Eager loading:** The `SlotController` loads `openingHours`, `breakTimes`, and `holidays` in a single query (`with()`), then passes the loaded model to `SlotService` which operates entirely in-memory — zero N+1 queries.
+
+---
+
+## Project Structure
+
+```
+app/
+├── Filament/
+│   ├── Resources/
+│   │   ├── BookingResource.php        (+ Pages/)
+│   │   ├── BreakTimeResource.php      (+ Pages/)
+│   │   ├── HolidayResource.php        (+ Pages/)
+│   │   ├── OpeningHourResource.php    (+ Pages/)
+│   │   └── ServiceResource.php        (+ Pages/)
+│   └── Widgets/
+│       └── BookingOverviewWidget.php
+├── Http/
+│   ├── Controllers/
+│   │   └── Api/
+│   │       ├── BookingController.php
+│   │       └── SlotController.php
+│   └── Requests/
+│       └── StoreBookingRequest.php
+├── Jobs/
+│   └── SendBookingConfirmationJob.php
+├── Mail/
+│   └── BookingConfirmationMail.php
+├── Models/
+│   ├── Booking.php
+│   ├── BreakTime.php
+│   ├── Holiday.php
+│   ├── OpeningHour.php
+│   └── Service.php
+├── Scopes/
+│   └── ActiveServiceScope.php
+└── Services/
+    └── SlotService.php
+```
